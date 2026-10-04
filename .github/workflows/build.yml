@@ -1,0 +1,1255 @@
+#include <SPI.h>
+#include <RF24.h>
+#include <EEPROM.h>
+
+RF24 radio(PB0, PB1);   // CE, CSN
+
+#define sim Serial3
+#define LED_PIN PB12
+
+// ================= MAX TANKS =================
+#define MAX_TANKS 4
+
+// ================= NRF CHANNELS =================
+// Tank 1 = 2401 MHz
+// Tank 2 = 2402 MHz
+// Tank 3 = 2403 MHz
+// Tank 4 = 2404 MHz
+
+const byte nrfChannel[MAX_TANKS] = {
+  1,
+  2,
+  3,
+  4
+};
+
+// ================= NRF ADDRESSES =================
+const byte tankAddr[MAX_TANKS][6] = {
+  "NODE1",
+  "NODE2",
+  "NODE3",
+  "NODE4"
+};
+
+// ================= GSM =================
+String senderNumber = "";
+
+// ================= LED =================
+bool ledDone = false;
+unsigned long ledStartTime = 0;
+
+bool pb13PulseDone = false;
+unsigned long bootTime = 0;
+
+// ================= PERIODIC DEFAULTS =================
+unsigned long lastDefaultSend = 0;
+
+// ================= EEPROM =================
+#define EE_ADDR 0
+
+struct TankSettings {
+
+  int tankHeight;
+  int onPercent;
+  int offPercent;
+
+  bool settings1Ready;
+  bool settings2Ready;
+};
+
+struct DataStore {
+
+  uint32_t flag;
+
+  int tankCount;
+
+  TankSettings tank[MAX_TANKS];
+};
+
+DataStore mem;
+
+// ================= EEPROM SAVE =================
+void saveToEEPROM() {
+
+  uint8_t *p = (uint8_t*)&mem;
+
+  for (int i = 0; i < sizeof(mem); i++) {
+
+    EEPROM.write(EE_ADDR + i, p[i]);
+  }
+}
+
+// ================= EEPROM LOAD =================
+bool loadFromEEPROM() {
+
+  uint8_t *p = (uint8_t*)&mem;
+
+  for (int i = 0; i < sizeof(mem); i++) {
+
+    p[i] = EEPROM.read(EE_ADDR + i);
+  }
+
+  if (mem.flag != 0xAABBCCDD)
+    return false;
+
+  if (mem.tankCount < 1 ||
+      mem.tankCount > MAX_TANKS)
+    return false;
+
+  return true;
+}
+
+// ================= CHECK TANK REGISTERED =================
+bool isTankRegistered(int tankNumber) {
+
+  if (!loadFromEEPROM())
+    return false;
+
+  if (tankNumber < 1 ||
+      tankNumber > mem.tankCount)
+    return false;
+
+  return true;
+}
+
+// ================= SET NRF CHANNEL =================
+void setTankChannel(int tankNumber) {
+
+  if (tankNumber < 1 ||
+      tankNumber > MAX_TANKS)
+    return;
+
+  radio.setChannel(
+    nrfChannel[tankNumber - 1]
+  );
+}
+
+// ================= PREPARE NRF TX =================
+void prepareTankTX(int tankNumber) {
+
+  setTankChannel(tankNumber);
+
+  radio.stopListening();
+
+  radio.openWritingPipe(
+    tankAddr[tankNumber - 1]
+  );
+}
+
+// ================= PREPARE NRF RX =================
+void prepareTankRX(int tankNumber) {
+
+  setTankChannel(tankNumber);
+
+  radio.stopListening();
+
+  radio.openReadingPipe(
+    1,
+    tankAddr[tankNumber - 1]
+  );
+
+  radio.startListening();
+}
+
+// ================= SEND TO TANK =================
+bool sendToTank(
+  int tankNumber,
+  const char *msg
+) {
+
+  if (tankNumber < 1 ||
+      tankNumber > MAX_TANKS)
+    return false;
+
+  prepareTankTX(tankNumber);
+
+  bool ok =
+    radio.write(
+      msg,
+      strlen(msg) + 1
+    );
+
+  radio.stopListening();
+
+  return ok;
+}
+
+// ================= SEND HEIGHT =================
+void sendHeight(
+  int tankNumber,
+  int height
+) {
+
+  char msg[16];
+
+  sprintf(
+    msg,
+    "H%d",
+    height
+  );
+
+  bool ok =
+    sendToTank(
+      tankNumber,
+      msg
+    );
+
+  Serial.print("Tank ");
+  Serial.print(tankNumber);
+  Serial.print(" HEIGHT -> ");
+  Serial.print(height);
+  Serial.print("  RESULT=");
+  Serial.println(ok);
+}
+
+// ================= SEND PERCENTAGES =================
+void sendPercents(
+  int tankNumber,
+  int onPercent,
+  int offPercent
+) {
+
+  char msg[20];
+
+  sprintf(
+    msg,
+    "P%d/%d",
+    onPercent,
+    offPercent
+  );
+
+  bool ok =
+    sendToTank(
+      tankNumber,
+      msg
+    );
+
+  Serial.print("Tank ");
+  Serial.print(tankNumber);
+  Serial.print(" PERCENT -> ");
+  Serial.print(onPercent);
+  Serial.print("/");
+  Serial.print(offPercent);
+  Serial.print("  RESULT=");
+  Serial.println(ok);
+}
+
+// ================= SEND COMPLETE DEFAULTS =================
+void sendDefaults(int tankNumber) {
+
+  if (!isTankRegistered(tankNumber))
+    return;
+
+  TankSettings &t =
+    mem.tank[tankNumber - 1];
+
+  // فقط تنظیمات ثبت‌شده همین تانکر ارسال شود
+
+  if (t.settings1Ready) {
+
+    sendHeight(
+      tankNumber,
+      t.tankHeight
+    );
+
+    delay(50);
+  }
+
+  if (t.settings2Ready) {
+
+    sendPercents(
+      tankNumber,
+      t.onPercent,
+      t.offPercent
+    );
+
+    delay(50);
+  }
+}
+
+// ================= CHECK REQUEST =================
+void sendCheckRequest(
+  int tankNumber
+) {
+
+  char msg[] = "CHK";
+
+  sendToTank(
+    tankNumber,
+    msg
+  );
+}
+
+// ================= GET CHECK RESPONSE =================
+String getCheckResponse(
+  int tankNumber
+) {
+
+  prepareTankRX(tankNumber);
+
+  unsigned long start =
+    millis();
+
+  while (
+    millis() - start < 5000
+  ) {
+
+    if (radio.available()) {
+
+      char reply[64] = "";
+
+      radio.read(
+        &reply,
+        sizeof(reply)
+      );
+
+      radio.stopListening();
+
+      return String(reply);
+    }
+  }
+
+  radio.stopListening();
+
+  return "";
+}
+
+// ================= ANT CHECK ONE TANK =================
+int checkNRF24(
+  int tankNumber
+) {
+
+  if (!isTankRegistered(tankNumber))
+    return -1;
+
+  int successful = 0;
+
+  for (int i = 0; i < 10; i++) {
+
+    char msg[] = "ANT";
+
+    prepareTankTX(tankNumber);
+
+    bool sent =
+      radio.write(
+        &msg,
+        sizeof(msg)
+      );
+
+    radio.stopListening();
+
+    if (!sent) {
+
+      delay(50);
+      continue;
+    }
+
+    prepareTankRX(tankNumber);
+
+    unsigned long start =
+      millis();
+
+    bool received = false;
+
+    while (
+      millis() - start < 500
+    ) {
+
+      if (radio.available()) {
+
+        char reply[32] = "";
+
+        radio.read(
+          &reply,
+          sizeof(reply)
+        );
+
+        String response =
+          String(reply);
+
+        response.trim();
+
+        String expected =
+          "NODE" +
+          String(tankNumber) +
+          ":ANTOK";
+
+        if (response ==
+            expected) {
+
+          successful++;
+          received = true;
+        }
+
+        break;
+      }
+    }
+
+    radio.stopListening();
+
+    delay(50);
+  }
+
+  return successful * 10;
+}
+
+// ================= ANT CHECK ALL =================
+String checkAllNRF24() {
+
+  if (!loadFromEEPROM()) {
+
+    return "NRF24: No tank registered";
+  }
+
+  String result = "";
+
+  for (
+    int i = 1;
+    i <= mem.tankCount;
+    i++
+  ) {
+
+    int score =
+      checkNRF24(i);
+
+    result +=
+      "Tank " +
+      String(i) +
+      " NRF: " +
+      String(score) +
+      "/100";
+
+    if (i < mem.tankCount)
+      result += "\n";
+  }
+
+  return result;
+}
+
+// ================= CHECK NRF REQUEST =================
+// مادر برد کانال‌های تانکرهای ثبت‌شده را
+// بررسی می‌کند تا REQ هر تانکر را دریافت کند.
+
+void checkNRFRequests() {
+
+  if (!loadFromEEPROM())
+    return;
+
+  for (
+    int i = 1;
+    i <= mem.tankCount;
+    i++
+  ) {
+
+    prepareTankRX(i);
+
+    unsigned long start =
+      millis();
+
+    while (
+      millis() - start < 5
+    ) {
+
+      if (radio.available()) {
+
+        char msg[32] = "";
+
+        radio.read(
+          &msg,
+          sizeof(msg)
+        );
+
+        String cmd =
+          String(msg);
+
+        cmd.trim();
+
+        if (cmd == "REQ") {
+
+          Serial.print(
+            "REQ FROM TANK "
+          );
+
+          Serial.println(i);
+
+          radio.stopListening();
+
+          sendDefaults(i);
+
+          return;
+        }
+      }
+    }
+
+    radio.stopListening();
+  }
+}
+
+// ================= GSM SIGNAL =================
+String getGSMSignal() {
+
+  while (sim.available()) {
+    sim.read();
+  }
+
+  sim.println("AT+CSQ");
+
+  unsigned long start =
+    millis();
+
+  String response = "";
+
+  while (
+    millis() - start < 3000
+  ) {
+
+    while (sim.available()) {
+
+      char c = sim.read();
+
+      response += c;
+    }
+  }
+
+  int pos =
+    response.indexOf("+CSQ:");
+
+  if (pos == -1) {
+
+    return "GSM: No response";
+  }
+
+  int comma =
+    response.indexOf(
+      ",",
+      pos
+    );
+
+  if (comma == -1) {
+
+    return "GSM: Unknown";
+  }
+
+  String value =
+    response.substring(
+      pos + 6,
+      comma
+    );
+
+  value.trim();
+
+  int csq =
+    value.toInt();
+
+  String quality;
+
+  if (csq == 99) {
+
+    quality = "Unknown";
+  }
+
+  else if (csq >= 20) {
+
+    quality = "Excellent";
+  }
+
+  else if (csq >= 15) {
+
+    quality = "Good";
+  }
+
+  else if (csq >= 10) {
+
+    quality = "Fair";
+  }
+
+  else if (csq >= 2) {
+
+    quality = "Weak";
+  }
+
+  else {
+
+    quality = "Very weak";
+  }
+
+  return
+    "GSM: " +
+    quality +
+    " (CSQ: " +
+    String(csq) +
+    ")";
+}
+
+// ================= SMS =================
+void sendSMS(String text) {
+
+  if (senderNumber == "")
+    return;
+
+  sim.println("AT+CMGF=1");
+
+  delay(200);
+
+  sim.print(
+    "AT+CMGS=\""
+  );
+
+  sim.print(
+    senderNumber
+  );
+
+  sim.println("\"");
+
+  delay(500);
+
+  sim.print(text);
+
+  delay(200);
+
+  sim.write(26);
+
+  delay(3000);
+}
+
+// ================= SETUP =================
+void setup() {
+
+  Serial.begin(115200);
+
+  pinMode(
+    LED_PIN,
+    OUTPUT
+  );
+
+  pinMode(
+    PB13,
+    OUTPUT
+  );
+
+  digitalWrite(
+    PB13,
+    LOW
+  );
+
+  // LED Active Low
+  digitalWrite(
+    LED_PIN,
+    HIGH
+  );
+
+  ledStartTime =
+    millis();
+
+  bootTime =
+    millis();
+
+  sim.begin(9600);
+
+  SPI.begin();
+
+  radio.begin();
+
+  radio.setPALevel(
+    RF24_PA_LOW
+  );
+
+  radio.setDataRate(
+    RF24_250KBPS
+  );
+
+  radio.setChannel(1);
+
+  radio.openReadingPipe(
+    1,
+    tankAddr[0]
+  );
+
+  radio.startListening();
+
+  delay(3000);
+
+  sim.println(
+    "AT+CMGF=1"
+  );
+
+  delay(500);
+
+  sim.println(
+    "AT+CNMI=2,2,0,0,0"
+  );
+
+  Serial.println(
+    "MOTHER BOARD READY"
+  );
+
+  if (loadFromEEPROM()) {
+
+    Serial.print(
+      "REGISTERED TANKS = "
+    );
+
+    Serial.println(
+      mem.tankCount
+    );
+
+    for (
+      int i = 1;
+      i <= mem.tankCount;
+      i++
+    ) {
+
+      sendDefaults(i);
+
+      delay(100);
+    }
+  }
+}
+
+// ================= LOOP =================
+void loop() {
+
+  // ================= LED =================
+  if (
+    !ledDone &&
+    millis() -
+    ledStartTime >=
+    3000
+  ) {
+
+    digitalWrite(
+      LED_PIN,
+      LOW
+    );
+
+    ledDone = true;
+  }
+
+  // ================= PB13 =================
+  if (
+    !pb13PulseDone &&
+    millis() -
+    bootTime >=
+    16000UL
+  ) {
+
+    digitalWrite(
+      PB13,
+      HIGH
+    );
+
+    delay(700);
+
+    digitalWrite(
+      PB13,
+      LOW
+    );
+
+    pb13PulseDone = true;
+  }
+
+  // ================= NRF REQUEST =================
+  checkNRFRequests();
+
+  // ================= SMS =================
+  if (sim.available()) {
+
+    String sms =
+      sim.readStringUntil('\n');
+
+    sms.trim();
+
+    // ================= SMS HEADER =================
+    if (
+      sms.startsWith("+CMT:")
+    ) {
+
+      int q1 =
+        sms.indexOf("\"");
+
+      int q2 =
+        sms.indexOf(
+          "\"",
+          q1 + 1
+        );
+
+      if (
+        q1 >= 0 &&
+        q2 > q1
+      ) {
+
+        senderNumber =
+          sms.substring(
+            q1 + 1,
+            q2
+          );
+      }
+
+      return;
+    }
+
+    if (
+      sms == "OK" ||
+      sms == "ERROR" ||
+      sms.length() == 0
+    ) {
+
+      return;
+    }
+
+    String cmd = sms;
+
+    cmd.trim();
+
+    cmd.toUpperCase();
+
+    // ================= ANT CHECK =================
+    if (
+      cmd == "ANT CHECK"
+    ) {
+
+      String gsmStatus =
+        getGSMSignal();
+
+      String nrfStatus =
+        checkAllNRF24();
+
+      String reply =
+        gsmStatus +
+        "\n" +
+        nrfStatus;
+
+      sendSMS(reply);
+
+      return;
+    }
+
+    // ================= TANKERS SET =================
+    if (
+      cmd.startsWith(
+        "TANKERS SET"
+      )
+    ) {
+
+      String value =
+        cmd.substring(11);
+
+      value.trim();
+
+      int tankCount =
+        value.toInt();
+
+      if (
+        tankCount < 1 ||
+        tankCount > 4
+      ) {
+
+        sendSMS(
+          "Error: Number of tanks must be between 1 and 4"
+        );
+
+        return;
+      }
+
+      mem.flag =
+        0xAABBCCDD;
+
+      mem.tankCount =
+        tankCount;
+
+      for (
+        int i = 0;
+        i < MAX_TANKS;
+        i++
+      ) {
+
+        mem.tank[i].tankHeight = 0;
+
+        mem.tank[i].onPercent = 0;
+
+        mem.tank[i].offPercent = 0;
+
+        mem.tank[i].settings1Ready =
+          false;
+
+        mem.tank[i].settings2Ready =
+          false;
+      }
+
+      saveToEEPROM();
+
+      sendSMS(
+        String(tankCount) +
+        " tanks set. Please send the next settings."
+      );
+
+      return;
+    }
+
+    // ================= TANK COMMANDS =================
+    if (
+      cmd.startsWith("TANK")
+    ) {
+
+      if (!loadFromEEPROM()) {
+
+        sendSMS(
+          "Please set the number of tanks first"
+        );
+
+        return;
+      }
+
+      if (cmd.length() < 6)
+        return;
+
+      char tankChar =
+        cmd.charAt(4);
+
+      if (
+        tankChar < '1' ||
+        tankChar > '4'
+      ) {
+
+        sendSMS(
+          "Invalid tank number"
+        );
+
+        return;
+      }
+
+      int tankNumber =
+        tankChar - '0';
+
+      // تانکر خارج از تعداد ثبت‌شده
+      if (
+        tankNumber >
+        mem.tankCount
+      ) {
+
+        sendSMS(
+          "Tank " +
+          String(tankNumber) +
+          " is not registered"
+        );
+
+        return;
+      }
+
+      // ================= SETTINGS1 =================
+      String settings1Command =
+        "TANK" +
+        String(tankNumber) +
+        " SETTINGS1";
+
+      if (
+        cmd.startsWith(
+          settings1Command
+        )
+      ) {
+
+        int p =
+          cmd.lastIndexOf(' ');
+
+        if (p < 0)
+          return;
+
+        int height =
+          cmd.substring(
+            p + 1
+          ).toInt();
+
+        if (height <= 0) {
+
+          sendSMS(
+            "Invalid tank height"
+          );
+
+          return;
+        }
+
+        mem.tank[
+          tankNumber - 1
+        ].tankHeight =
+          height;
+
+        mem.tank[
+          tankNumber - 1
+        ].settings1Ready =
+          true;
+
+        mem.flag =
+          0xAABBCCDD;
+
+        saveToEEPROM();
+
+        sendHeight(
+          tankNumber,
+          height
+        );
+
+        sendSMS(
+          String(height) +
+          " cm tank " +
+          String(tankNumber) +
+          " height saved"
+        );
+
+        return;
+      }
+
+      // ================= SETTINGS2 =================
+      String settings2Command =
+        "TANK" +
+        String(tankNumber) +
+        " SETTINGS2";
+
+      if (
+        cmd.startsWith(
+          settings2Command
+        )
+      ) {
+
+        int p =
+          cmd.lastIndexOf(' ');
+
+        if (p < 0)
+          return;
+
+        String value =
+          cmd.substring(
+            p + 1
+          );
+
+        int slash =
+          value.indexOf('/');
+
+        if (slash <= 0) {
+
+          sendSMS(
+            "Invalid Settings2 format"
+          );
+
+          return;
+        }
+
+        int onP =
+          value.substring(
+            0,
+            slash
+          ).toInt();
+
+        int offP =
+          value.substring(
+            slash + 1
+          ).toInt();
+
+        if (
+          onP < 0 ||
+          offP > 100 ||
+          onP >= offP
+        ) {
+
+          sendSMS(
+            "Error: ON must be lower than OFF and OFF must be 100 or lower"
+          );
+
+          return;
+        }
+
+        mem.tank[
+          tankNumber - 1
+        ].onPercent =
+          onP;
+
+        mem.tank[
+          tankNumber - 1
+        ].offPercent =
+          offP;
+
+        mem.tank[
+          tankNumber - 1
+        ].settings2Ready =
+          true;
+
+        mem.flag =
+          0xAABBCCDD;
+
+        saveToEEPROM();
+
+        sendPercents(
+          tankNumber,
+          onP,
+          offP
+        );
+
+        sendSMS(
+          "Saved. Pump ON at " +
+          String(onP) +
+          "% and OFF at " +
+          String(offP) +
+          "%"
+        );
+
+        return;
+      }
+    }
+
+    // ================= CHECK1 - CHECK4 =================
+    if (
+      cmd.startsWith("CHECK")
+    ) {
+
+      String value =
+        cmd.substring(5);
+
+      value.trim();
+
+      int tankNumber =
+        value.toInt();
+
+      if (
+        tankNumber < 1 ||
+        tankNumber > 4
+      ) {
+
+        sendSMS(
+          "Invalid tank number"
+        );
+
+        return;
+      }
+
+      if (
+        !isTankRegistered(
+          tankNumber
+        )
+      ) {
+
+        sendSMS(
+          "Tank " +
+          String(tankNumber) +
+          " is not registered"
+        );
+
+        return;
+      }
+
+      // اگر تنظیمات کامل نشده
+      if (
+        !mem.tank[
+          tankNumber - 1
+        ].settings1Ready ||
+        !mem.tank[
+          tankNumber - 1
+        ].settings2Ready
+      ) {
+
+        sendSMS(
+          "Tank " +
+          String(tankNumber) +
+          " is not fully configured"
+        );
+
+        return;
+      }
+
+      sendCheckRequest(
+        tankNumber
+      );
+
+      String response =
+        getCheckResponse(
+          tankNumber
+        );
+
+      if (
+        response.length() > 0
+      ) {
+
+        TankSettings &t =
+          mem.tank[
+            tankNumber - 1
+          ];
+
+        String reply =
+          "Tank " +
+          String(tankNumber) +
+          "\n";
+
+        reply += response;
+
+        reply +=
+          "\nH=" +
+          String(
+            t.tankHeight
+          );
+
+        reply +=
+          "\nON=" +
+          String(
+            t.onPercent
+          ) +
+          "%";
+
+        reply +=
+          "\nOFF=" +
+          String(
+            t.offPercent
+          ) +
+          "%";
+
+        sendSMS(reply);
+      }
+
+      else {
+
+        TankSettings &t =
+          mem.tank[
+            tankNumber - 1
+          ];
+
+        sendSMS(
+          "Check failed for Tank " +
+          String(tankNumber) +
+          "\nH=" +
+          String(t.tankHeight) +
+          "\nON=" +
+          String(t.onPercent) +
+          "%\nOFF=" +
+          String(t.offPercent) +
+          "%"
+        );
+      }
+
+      return;
+    }
+  }
+
+  // ================= PERIODIC DEFAULTS =================
+  if (
+    loadFromEEPROM() &&
+    millis() -
+    lastDefaultSend >=
+    20000UL
+  ) {
+
+    for (
+      int i = 1;
+      i <= mem.tankCount;
+      i++
+    ) {
+
+      sendDefaults(i);
+
+      delay(100);
+    }
+
+    lastDefaultSend =
+      millis();
+
+    Serial.println(
+      "DEFAULTS PERIODIC SENT"
+    );
+  }
+}
