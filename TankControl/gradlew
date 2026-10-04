@@ -1,0 +1,16 @@
+#!/bin/sh
+APP_HOME=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+WRAPPER_JAR="$APP_HOME/gradle/wrapper/gradle-wrapper.jar"
+
+if [ ! -f "$WRAPPER_JAR" ]; then
+  echo "gradle-wrapper.jar is missing; downloading the Gradle 8.7 wrapper..."
+  mkdir -p "$APP_HOME/gradle/wrapper"
+  curl -fL --retry 3 -o "$WRAPPER_JAR" \
+    "https://raw.githubusercontent.com/gradle/gradle/v8.7.0/gradle/wrapper/gradle-wrapper.jar" || {
+      echo "ERROR: Could not download gradle-wrapper.jar."
+      exit 1
+    }
+fi
+
+exec java -classpath "$WRAPPER_JAR" org.gradle.wrapper.GradleWrapperMain "$@"
